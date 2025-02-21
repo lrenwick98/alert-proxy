@@ -53,7 +53,7 @@ azure_devops_url_query = "https://dev.azure.com/{organization}/{project}/_apis/w
 
 @app.post("/alert")
 async def alert_proxy(request: Request) -> dict:
-    """Handles incoming alerts and creates work items in Azure DevOps if necessary."""
+# Handles incoming alerts and creates work items in Azure DevOps if necessary. 
     try:
         alert_data = await request.json()
     except json.JSONDecodeError as e:
