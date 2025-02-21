@@ -5,12 +5,13 @@ import json
 import requests
 import base64
 
+# Initialize FastAPI app
 app = FastAPI()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 
-#Suppress specific logging from kubernetes client for sensitive secret data
+# Suppress specific logging from Kubernetes client for sensitive secret data
 logging.getLogger("kubernetes").setLevel(logging.WARNING)
 
 # Get the current namespace from the service account file
@@ -25,40 +26,34 @@ except Exception as e:
     logging.error(f"Error reading namespace file: {e}")
     raise HTTPException(status_code=500, detail="Error reading namespace file")
 
-# Load the kubeconfig to interact with the cluster and read + pass in the secret value for the azure token
+# Load Kubernetes configuration and retrieve Azure DevOps token
 try:
     config.load_incluster_config()
     v1 = client.CoreV1Api()
-
     secret = v1.read_namespaced_secret("azure-devops-pat-token", namespace)
-    secret_data = secret.data
-    decoded_data = {key: base64.b64decode(value).decode('utf-8') for key, value in secret_data.items()}
 
-    token_value = decoded_data.get('token')
+    if not secret.data:
+        logging.error("Secret data is empty")
+        raise HTTPException(status_code=500, detail="Azure DevOps token missing in secret")
+
+    decoded_data = {key: base64.b64decode(value).decode("utf-8") for key, value in secret.data.items()}
+    token_value = decoded_data.get("token")
+
     if not token_value:
-        raise KeyError("Token not found in the secret")
+        logging.error("Token key missing in secret data")
+        raise HTTPException(status_code=500, detail="Azure DevOps token not found")
 except Exception as e:
     logging.error(f"Error loading Kubernetes configuration or secret: {e}")
     raise HTTPException(status_code=500, detail="Error loading Kubernetes configuration or secret")
 
-auth_value = base64.b64encode(f":{token_value}".encode('utf-8')).decode('utf-8')
-
-azure_devops_url = "https://dev.azure.com/{organization}/{project}_apis/wit/workitems/$Bug?api-version=7.2-preview.3"
+# Azure DevOps API URLs
+azure_devops_url = "https://dev.azure.com/{organization}/{project}/_apis/wit/workitems/$Bug?api-version=7.2-preview.3"
 azure_devops_url_query = "https://dev.azure.com/{organization}/{project}/_apis/wit/wiql?api-version=7.2-preview.2"
 
-query_headers = {
-    'Content-Type': 'application/json',
-    'Authorization': f"Basic {auth_value}",
-}
-
-post_headers = {
-    'Content-Type': 'application/json-patch+json',
-    'Authorization': f"Basic {auth_value}",
-}
 
 @app.post("/alert")
-async def alert_proxy(request: Request):
-    # Step 1: Capture the incoming Alertmanager webhook
+async def alert_proxy(request: Request) -> dict:
+    """Handles incoming alerts and creates work items in Azure DevOps if necessary."""
     try:
         alert_data = await request.json()
     except json.JSONDecodeError as e:
@@ -68,80 +63,64 @@ async def alert_proxy(request: Request):
         logging.error(f"Error reading alert data: {e}")
         raise HTTPException(status_code=500, detail="Error reading alert data")
 
-    # Step 2: Loop through all alerts and process each one
-    response_messages = []  # List to hold the messages for each alert
+    # Generate authentication headers inside the function
+    auth_value = base64.b64encode(f":{token_value}".encode("utf-8")).decode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {auth_value}",
+    }
 
-    for alert in alert_data.get('alerts', []):
-        try:
-            system_info = json.dumps(alert)
-            alert_name = alert['labels']['alertname']
-            fingerprint = alert['fingerprint']
-        except KeyError as e:
-            logging.warning(f"Missing expected key in alert data: {e}")
-            response_messages.append(f"Skipping alert due to missing key: {e}")
-            continue  # Skip this alert if the key is missing
+    response_messages = []  # Collect response messages
 
-        # Check if a Bug work item with the given fingerprint tag already exists
+    for alert in alert_data.get("alerts", []):
+        system_info = json.dumps(alert)
+        alert_name = alert.get("labels", {}).get("alertname", "Unknown Alert")
+        fingerprint = alert.get("fingerprint", "unknown")
+
+        if fingerprint == "unknown":
+            logging.warning(f"Skipping alert due to missing fingerprint: {alert}")
+            response_messages.append("Skipping alert due to missing fingerprint")
+            continue
+
+        # Query Azure DevOps to check if work item already exists
         wiql_query = {
             "query": f"SELECT [System.Id] FROM WorkItems WHERE [System.WorkItemType] = 'Bug' AND [System.Tags] CONTAINS '{fingerprint}'"
         }
 
-        # Send the WIQL query to Azure DevOps to find existing work items with the fingerprint
         try:
-            response = requests.post(azure_devops_url_query, headers=query_headers, data=json.dumps(wiql_query))
-            response.raise_for_status()  # Will raise an exception for status codes >= 400
+            response = requests.post(azure_devops_url_query, headers=headers, json=wiql_query)
+            response.raise_for_status()
+            query_result = response.json()
         except requests.exceptions.RequestException as e:
             logging.error(f"Error querying work items: {e}")
             return {"status": "failure", "message": f"Error querying work items: {str(e)}"}
 
-        if response.status_code == 200:
-            result = response.json()
+        # If no existing bug, create a new work item
+        if not query_result.get("workItems", []):
+            logging.info(f"No existing bug with fingerprint {fingerprint} found. Creating a new work item.")
 
-            logging.debug("Query response: \n %s", result)
+            payload = [
+                {"op": "add", "path": "/fields/System.Title", "value": alert_name},
+                {"op": "add", "path": "/fields/Microsoft.VSTS.TCM.SystemInfo", "value": system_info},
+                {"op": "add", "path": "/fields/System.Tags", "value": fingerprint},
+            ]
 
-            # If the workItems array is empty, it means no bug with the fingerprint exists. Proceed with creation.
-            if not result.get('workItems', []):
-                logging.info(f"No existing bug with fingerprint {fingerprint} found. Proceeding to create a new work item.")
+            headers["Content-Type"] = "application/json-patch+json"  # Change content type for POST request
 
-                # Prepare the payload for Azure DevOps Work Item creation
-                payload = json.dumps([
-                    {
-                        "op": "add",
-                        "path": "/fields/System.Title",
-                        "value": alert_name
-                    },
-                    {
-                        "op": "add",
-                        "path": "/fields/Microsoft.VSTS.TCM.SystemInfo",
-                        "value": system_info
-                    },
-                    {
-                        "op": "add",
-                        "path": "/fields/System.Tags",
-                        "value": fingerprint
-                    }
-                ])
+            try:
+                post_response = requests.post(azure_devops_url, headers=headers, json=payload)
+                post_response.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Error creating work item: {e}")
+                return {"status": "failure", "message": f"Error creating work item: {str(e)}"}
 
-                # Send the POST request to create a work item
-                try:
-                    post_response = requests.post(azure_devops_url, headers=post_headers, data=payload)
-                    post_response.raise_for_status()  # Will raise an exception for status codes >= 400
-                except requests.exceptions.RequestException as e:
-                    logging.error(f"Error creating work item: {e}")
-                    return {"status": "failure", "message": f"Error creating work item: {str(e)}"}
-
-                logging.debug(f"Work item creation response: {post_response.status_code}, {post_response.text}")
-
-                if post_response.status_code in [200, 201]:
-                    response_messages.append(f"Work item created for alert {alert_name} with fingerprint {fingerprint}")
-                else:
-                    response_messages.append(f"Failed to create work item for alert {alert_name} with fingerprint {fingerprint}. Error: {post_response.text}")
+            if post_response.status_code in [200, 201]:
+                logging.info(f"Successfully created work item for {alert_name} ({fingerprint})")
+                response_messages.append(f"Work item created for alert {alert_name}")
             else:
-                logging.info(f"Existing bug with fingerprint {fingerprint} found. Skipping creation.")
-                response_messages.append(f"Bug with fingerprint {fingerprint} already exists. Skipping creation.")
+                response_messages.append(f"Failed to create work item for alert {alert_name}: {post_response.text}")
         else:
-            logging.error(f"Error querying work items: {response.status_code} - {response.text}")
-            response_messages.append(f"Error querying work items for fingerprint {fingerprint}: {response.text}")
+            logging.info(f"Existing bug with fingerprint {fingerprint} found. Skipping creation.")
+            response_messages.append(f"Bug with fingerprint {fingerprint} already exists. Skipping creation.")
 
-    # Return the collected messages for all alerts
     return {"status": "success", "messages": response_messages}
