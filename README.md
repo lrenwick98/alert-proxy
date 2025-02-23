@@ -37,7 +37,7 @@ The request should be a JSON object containing the alerts array. Each alert shou
 - fingerprint: A unique identifier for the alert (used to check if a work item with the same fingerprint already exists).
 
 Example:
-json
+```json
 {
   "alerts": [
      {
